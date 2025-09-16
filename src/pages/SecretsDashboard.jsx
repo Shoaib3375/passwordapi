@@ -13,6 +13,13 @@ const SecretsDashboard = () => {
     const [editSecret, setEditSecret] = useState(null)
     const [editForm, setEditForm] = useState({ title: '', username: '', password: '', email: '', website: '', note: '' })
 
+    // Create panel state
+    const [showCreate, setShowCreate] = useState(false)
+    const [createForm, setCreateForm] = useState({ title: '', username: '', password: '', email: '', website: '', note: '' })
+    const [createLoading, setCreateLoading] = useState(false)
+    const [createError, setCreateError] = useState('')
+
+
     const navigate = useNavigate()
 
     // Throttling and retry guards to avoid rate limiting
@@ -144,10 +151,112 @@ const SecretsDashboard = () => {
         }
     };
 
+    // Create form handlers
+    const handleCreateChange = (e) => {
+        setCreateForm({ ...createForm, [e.target.name]: e.target.value })
+    }
+
+    const resetCreateForm = () => {
+        setCreateForm({ title: '', username: '', password: '', email: '', website: '', note: '' })
+        setCreateError('')
+        setCreateLoading(false)
+    }
+
+    const closeCreatePanel = () => {
+        setShowCreate(false)
+        resetCreateForm()
+    }
+
+    const refreshSecretsAfterCreate = async () => {
+        // After creating, avoid hammering the list endpoint which may be rate limited.
+        // Respect Retry-After when present and use a short capped exponential backoff.
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+        let attempt = 0
+        let delay = 600 // start with a short delay so the server can settle
+        const MAX_RETRIES = 3
+        while (attempt <= MAX_RETRIES) {
+            try {
+                if (attempt > 0) {
+                    await sleep(delay)
+                } else {
+                    // tiny initial delay even before first attempt to reduce immediate 429 after POST
+                    await sleep(300)
+                }
+                const res = await api.get('/secret/api/list')
+                setSecrets(res.data?.data?.secrets || [])
+                setError('')
+                return
+            } catch (err) {
+                const status = err?.response?.status
+                if (status === 429 && attempt < MAX_RETRIES) {
+                    const retryAfter = err.response?.headers?.['retry-after']
+                    const parsed = Number(retryAfter)
+                    // if server suggests a wait, honor it (seconds)
+                    if (!Number.isNaN(parsed) && parsed > 0) {
+                        delay = Math.max(delay * 2, parsed * 1000)
+                    } else {
+                        delay = Math.min(delay * 2, 4000)
+                    }
+                    attempt += 1
+                    continue
+                }
+                // Don't override a visible createError, but show a general error if needed
+                const msg = err?.response?.data?.message || err.message
+                setError(msg)
+                return
+            }
+        }
+    }
+
+    const handleCreateSubmit = async (e) => {
+        e.preventDefault()
+        if (createLoading) return
+        setCreateLoading(true)
+        setCreateError('')
+        try {
+            await api.post('/secret/api/create', {
+                title: createForm.title,
+                username: createForm.username,
+                password: createForm.password,
+                note: createForm.note,
+                email: createForm.email,
+                website: createForm.website,
+            })
+            await refreshSecretsAfterCreate()
+            closeCreatePanel()
+        } catch (err) {
+            const status = err?.response?.status
+            if (status === 429) {
+                const retryAfter = err.response?.headers?.['retry-after']
+                let msg = 'Too many requests. Please wait a moment and try again.'
+                if (retryAfter) msg += ` Retry after ${retryAfter} seconds.`
+                setCreateError(msg)
+            } else if (status === 401) {
+                setCreateError('Your session expired. Please log in again.')
+                clearAuthData()
+                navigate('/')
+                return
+            } else {
+                const msg = err.response?.data?.message || err.message
+                setCreateError(msg)
+            }
+        } finally {
+            setCreateLoading(false)
+        }
+    }
+
 
     return (
         <div className="p-4 max-w-4xl mx-auto">
-            <h1 className="text-xl font-semibold mb-4">Your Secrets</h1>
+            <div className="flex items-center justify-start gap-3 mb-4">
+                <button
+                    onClick={() => { setShowCreate(true); setCreateError(''); }}
+                    className="bg-green-600 hover:bg-green-700 text-white text-sm px-3 py-2 rounded"
+                >
+                    + Add Secret
+                </button>
+                <h1 className="text-xl font-semibold">Your Secrets</h1>
+            </div>
             {error && <div className="bg-red-100 text-red-700 p-2 rounded mb-3">{error}</div>}
             {isLoading && <div>Loading...</div>}
             {!error && !isLoading && secrets.length === 0 && <div>No secrets found.</div>}
@@ -178,6 +287,55 @@ const SecretsDashboard = () => {
                     </div>
                 ))}
             </div>
+
+            {showCreate && (
+                <div className="fixed inset-0 z-40 flex">
+                    {/* overlay */}
+                    <div className="flex-1 bg-transparent bg-opacity-30" onClick={closeCreatePanel} />
+                    {/* right panel */}
+                    <div className="w-full max-w-md h-full bg-white shadow-xl border-l p-5 overflow-y-auto">
+                        <div className="flex items-center justify-between mb-4">
+                            <h2 className="text-lg font-semibold">Create Secret</h2>
+                            <button onClick={closeCreatePanel} className="text-gray-500 hover:text-gray-700">✕</button>
+                        </div>
+                        {createError && (
+                            <div className="bg-red-100 text-red-700 p-2 rounded mb-3 text-sm">{createError}</div>
+                        )}
+                        <form onSubmit={handleCreateSubmit} className="space-y-3 text-sm">
+                            {['title','username','password','email','website'].map((field) => (
+                                <div key={field}>
+                                    <label className="block font-medium capitalize mb-1">{field}</label>
+                                    <input
+                                        type={field === 'password' ? 'password' : 'text'}
+                                        name={field}
+                                        value={createForm[field]}
+                                        onChange={handleCreateChange}
+                                        required={field === 'title'}
+                                        className="w-full border border-gray-300 p-2 rounded"
+                                    />
+                                </div>
+                            ))}
+                            <div>
+                                <label className="block font-medium mb-1">Note</label>
+                                <textarea
+                                    name="note"
+                                    value={createForm.note}
+                                    onChange={handleCreateChange}
+                                    className="w-full border border-gray-300 p-2 rounded min-h-[80px]"
+                                />
+                            </div>
+                            <div className="flex justify-end gap-2 pt-2">
+                                <button type="button" onClick={closeCreatePanel} className="bg-gray-500 text-white px-4 py-2 rounded">
+                                    Cancel
+                                </button>
+                                <button type="submit" disabled={createLoading} className="bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white px-4 py-2 rounded">
+                                    {createLoading ? 'Creating...' : 'Create'}
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            )}
 
             {editSecret && (
                 <div className="fixed inset-0 bg-transparent bg-opacity-50 flex items-center justify-center z-50">
