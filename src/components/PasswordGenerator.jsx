@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import api from '../api';
 
 const PasswordGenerator = () => {
@@ -7,20 +7,53 @@ const PasswordGenerator = () => {
     const [generated, setGenerated] = useState('');
     const [loading, setLoading] = useState(false);
     const [copied, setCopied] = useState(false);
+    const [error, setError] = useState('');
+    const [cooldown, setCooldown] = useState(false);
+
+    // Guard against double clicks and rapid firing before state updates
+    const inFlightRef = useRef(false);
+    const COOLDOWN_MS = 600; // throttle to ~1 request/second
+
+    const startCooldown = (ms = COOLDOWN_MS) => {
+        setCooldown(true);
+        setTimeout(() => setCooldown(false), ms);
+    };
 
     const generatePassword = async () => {
+        // Prevent spamming and concurrent requests
+        if (inFlightRef.current || loading || cooldown) {
+            return;
+        }
+        inFlightRef.current = true;
         setLoading(true);
+        startCooldown();
         try {
+            setError('');
             const res = await api.post('/secret/api/generatepassword', {
                 length,
                 include_special_symbol: includeSpecial,
             });
-            setGenerated(res.data.password);
+            // API returns { code, message, data: { password } }
+            const pwd = res?.data?.data?.password;
+            if (!pwd) {
+                throw new Error('Invalid response format');
+            }
+            setGenerated(pwd);
             setCopied(false);
         } catch (err) {
+            // Provide clearer feedback on rate limit responses
+            const status = err?.response?.status;
+            if (status === 429) {
+                setError('Too many requests. Please wait a moment before trying again.');
+                // extend cooldown when rate limited
+                startCooldown(3000);
+            } else {
+                setError('Failed to generate password. Please try again.');
+            }
             console.error('Failed to generate password:', err);
         } finally {
             setLoading(false);
+            inFlightRef.current = false;
         }
     };
 
@@ -57,11 +90,14 @@ const PasswordGenerator = () => {
                 </div>
                 <button
                     onClick={generatePassword}
-                    disabled={loading}
+                    disabled={loading || cooldown}
                     className="bg-indigo-600 hover:bg-indigo-700 text-white font-medium px-5 py-2 rounded-md transition disabled:opacity-50"
                 >
-                    {loading ? 'Generating...' : 'Generate Password'}
+                    {loading ? 'Generating...' : cooldown ? 'Please wait…' : 'Generate Password'}
                 </button>
+                {error && (
+                    <div className="text-red-600 text-sm mt-2" role="alert" aria-live="polite">{error}</div>
+                )}
                 {generated && (
                     <div className="mt-4">
                         <div className="bg-gray-100 border text-sm rounded flex items-center justify-between px-4 py-2">

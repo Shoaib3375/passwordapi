@@ -1,29 +1,62 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useRef } from 'react'
 import api from '../api'
 import { useNavigate } from "react-router-dom"
 import { clearAuthData } from "../utils/tokenUtils.jsx"
 
+// Dev-only guard to avoid double effect run in React 18 StrictMode
+let shouldSkipNextEffectInDev = true
+
 const SecretsDashboard = () => {
     const [secrets, setSecrets] = useState([])
     const [error, setError] = useState('')
-    const [isLoading, setIsLoading] = useState(false)
+    const [isLoading, setIsLoading] = useState(true)
     const [editSecret, setEditSecret] = useState(null)
     const [editForm, setEditForm] = useState({ title: '', username: '', password: '', email: '', website: '', note: '' })
 
     const navigate = useNavigate()
 
+    // Throttling and retry guards to avoid rate limiting
+    const inFlightRef = useRef(false)
+    const lastFetchAtRef = useRef(0)
+    const retryCountRef = useRef(0)
+    const retryTimeoutRef = useRef(null)
+
     useEffect(() => {
+        // In React 18 StrictMode (dev), effects run twice. Skip the first run to avoid duplicate loads.
+        if (import.meta?.env?.MODE !== 'production' && shouldSkipNextEffectInDev) {
+            shouldSkipNextEffectInDev = false
+            return
+        }
+
         let cancelled = false
-        let retryTimeout
+        const MIN_FETCH_INTERVAL_MS = 800
+        const inFlightRefLocal = inFlightRef
+        const lastFetchAtRefLocal = lastFetchAtRef
+        const retryCountRefLocal = retryCountRef
+        const retryTimeoutRefLocal = retryTimeoutRef
+
+        const scheduleRetry = (delayMs) => {
+            if (retryTimeoutRefLocal.current) clearTimeout(retryTimeoutRefLocal.current)
+            retryTimeoutRefLocal.current = setTimeout(() => {
+                if (!cancelled) fetchSecrets()
+            }, delayMs)
+        }
 
         const fetchSecrets = async () => {
-            if (isLoading) return
+            const now = Date.now()
+            if (inFlightRefLocal.current) return
+            if (now - lastFetchAtRefLocal.current < MIN_FETCH_INTERVAL_MS) return
+
+            inFlightRefLocal.current = true
+            lastFetchAtRefLocal.current = now
             setIsLoading(true)
+            let willRetry = false
             try {
                 const res = await api.get('/secret/api/list')
                 if (!cancelled) {
                     setSecrets(res.data.data.secrets)
                     setError('')
+                    retryCountRefLocal.current = 0
                 }
             } catch (err) {
                 if (cancelled) return
@@ -32,26 +65,46 @@ const SecretsDashboard = () => {
                     navigate('/')
                     return
                 }
-                if (err.response?.status === 429) {
-                    setError('Too many requests. Retrying...')
-                    retryTimeout = setTimeout(fetchSecrets, 2000)
-                    return
+                const status = err.response?.status
+                if (status === 429) {
+                    // Use Retry-After if provided or exponential backoff
+                    const retryAfter = err.response?.headers?.['retry-after']
+                    let delay = 1500 * Math.pow(2, retryCountRefLocal.current)
+                    const parsed = Number(retryAfter)
+                    if (!Number.isNaN(parsed) && parsed > 0) {
+                        delay = Math.max(delay, parsed * 1000)
+                    }
+                    if (retryCountRefLocal.current < 3) {
+                        retryCountRefLocal.current += 1
+                        setError('Too many requests. Retrying...')
+                        willRetry = true
+                        scheduleRetry(delay)
+                        return
+                    } else {
+                        setError('Too many requests. Please try again later.')
+                        return
+                    }
                 }
                 const msg = err.response?.data?.message || err.message
                 setError(msg)
-                if (err.response?.status === 401) {
+                if (status === 401) {
                     clearAuthData()
                     navigate('/')
                 }
             } finally {
-                if (!cancelled) setIsLoading(false)
+                if (!cancelled && !willRetry) setIsLoading(false)
+                inFlightRefLocal.current = false
             }
         }
 
         fetchSecrets()
         return () => {
             cancelled = true
-            if (retryTimeout) clearTimeout(retryTimeout)
+            if (retryTimeoutRefLocal.current) clearTimeout(retryTimeoutRefLocal.current)
+            // Reset dev guard after a real effect run so future mounts still skip the first dev run
+            if (import.meta?.env?.MODE !== 'production') {
+                shouldSkipNextEffectInDev = true
+            }
         }
     }, [navigate])
 
@@ -96,7 +149,8 @@ const SecretsDashboard = () => {
         <div className="p-4 max-w-4xl mx-auto">
             <h1 className="text-xl font-semibold mb-4">Your Secrets</h1>
             {error && <div className="bg-red-100 text-red-700 p-2 rounded mb-3">{error}</div>}
-            {!error && secrets.length === 0 && <div>No secrets found.</div>}
+            {isLoading && <div>Loading...</div>}
+            {!error && !isLoading && secrets.length === 0 && <div>No secrets found.</div>}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 {secrets.map(secret => (
                     <div key={secret.id} className="bg-white border p-3 rounded-md shadow-sm text-sm space-y-1">
